@@ -1,28 +1,40 @@
 # Competitive Intelligence Agent
 
-> LangGraph-powered API that researches any company and returns a structured competitive intelligence report in ~60 seconds.
+A multi-step AI agent that researches any company and returns a structured competitive report in ~60 seconds — built to demonstrate production MLOps patterns, not just LLM wrappers.
+
+```bash
+curl -X POST https://competitive-intel-agent.fly.dev/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"company_url":"https://linear.app"}'
+```
+
+```json
+{
+  "company_name": "Linear",
+  "overview": "Linear is a project management tool built for high-performance engineering teams...",
+  "competitors": ["Jira", "Asana", "Height"],
+  "recent_news": "Raised $35M Series B, launched Asks feature for cross-team requests...",
+  "strengths": ["Fast keyboard-driven UX", "Strong engineering culture following"],
+  "weaknesses": ["Limited enterprise features vs Jira", "Small team size"],
+  "sources": ["https://linear.app", "https://techcrunch.com/..."]
+}
+```
 
 ---
 
-## What it does
+## What makes this production-grade
 
-- **Researches any company in ~60 seconds** using live web search (Tavily) + public APIs
-- **Tracks token cost per run** — typically $0.001–$0.005 per report using Groq's free LLM tier
-- **Caches results 24 hours** — avoids duplicate API spend on repeated queries for the same company
+**Explicit agent graph** — built with LangGraph `StateGraph`, not a chain. Every node, edge, and routing decision is visible and testable. The graph separates concerns: `check_cache → gather → synthesize → write`.
 
----
+**Cost tracking per run** — every report stores `token_cost_usd` calculated from actual input/output token counts. A budget guard kills the run if cost exceeds $0.10, preventing runaway spend.
 
-## Tech Stack
+**24-hour idempotent caching** — before running any LLM calls, the agent checks SQLite for a recent report on the same URL. Duplicate requests return instantly at $0.00.
 
-| Layer      | Technology                  | Why                                                     |
-|------------|-----------------------------|---------------------------------------------------------|
-| Agent      | LangGraph StateGraph        | Explicit graph topology; easy to extend with new nodes  |
-| LLM        | Groq llama-3.3-70b-versatile (free) | ~10× cheaper than GPT-4            |
-| Search     | Tavily                      | Purpose-built for LLM agents; returns clean snippets    |
-| Database   | SQLite                      | Zero-dependency persistence; perfect for single-instance|
-| API        | FastAPI                     | Async, auto-docs, Pydantic validation out of the box    |
-| Deploy     | Fly.io                      | European region (Frankfurt); free hobby tier available  |
-| CI         | GitHub Actions              | Runs tests + builds Docker image on every push to main  |
+**Async background processing** — `POST /analyze` returns `202` immediately with a `report_id`. The agent runs in a background task. Poll `GET /reports/{id}` for results. No blocking, no timeouts.
+
+**Structured JSON logging** — every tool call logs `event`, `latency_ms`, and success/failure in JSON. Failures are visible in `/metrics` without digging through unstructured logs.
+
+**Graceful degradation** — if a tool fails, the error is accumulated in state and the agent continues with what it has. If JSON parsing fails on the LLM output, the raw text is preserved rather than losing the run entirely.
 
 ---
 
@@ -32,51 +44,86 @@
 POST /analyze
       │
       ▼
-  ┌─────────┐     tool_calls?     ┌───────────┐
-  │  plan   │ ─── yes ──────────► │   tools   │
-  └─────────┘                     └─────┬─────┘
-      │ no                              │
-      │                      budget ok? │
-      │                     ┌── yes ────┘
-      ▼                     ▼
-  ┌─────────┐     tool_calls?     ┌───────────┐
-  │  write  │ ◄── no ─────────── │  reflect  │
-  └─────────┘                     └───────────┘
-      │
-      ▼
-  JSON report saved to SQLite → returned via GET /reports/{id}
+┌─────────────┐   cache hit?   ┌──────────────────────────────┐
+│ check_cache │ ──── yes ─────►│ return existing report ($0)  │
+└──────┬──────┘                └──────────────────────────────┘
+       │ miss
+       ▼
+┌─────────────┐   3 parallel tool calls:
+│   gather    │ ── get_company_metadata (Clearbit)
+└──────┬──────┘ ── search_web × 3 (Tavily: overview, competitors, news)
+       │
+       ▼
+┌─────────────┐   LLM synthesis on gathered context (~1000 tokens in)
+│  synthesize │ ── Groq llama-3.3-70b → structured JSON out
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐   brace-matched JSON extraction → SQLite persist
+│    write    │ ── token cost calculated → run_complete logged
+└─────────────┘
 ```
-
-**Graph flow:** `plan → [tools] → reflect → [tools] → write → response`
-
-Budget guard: if cumulative token cost exceeds $0.10 or errors ≥ 3, the agent skips reflect and goes straight to write.
 
 ---
 
-## Quick Start
+## Stack
+
+| Layer | Choice | Reason |
+|---|---|---|
+| Agent | LangGraph StateGraph | Explicit graph; nodes are unit-testable in isolation |
+| LLM | Groq llama-3.3-70b | Free tier, 10× cheaper than GPT-4, fast enough for sync UX |
+| Search | Tavily | Built for agents; returns clean snippets not raw HTML |
+| Metadata | Clearbit autocomplete | Free, no key needed, returns structured company data |
+| Database | SQLite | Zero ops overhead; persistent volume on Fly.io |
+| API | FastAPI | Async, auto-docs at `/docs`, Pydantic validation |
+| Deploy | Fly.io (Frankfurt) | Close to EU users; free hobby tier; persistent volumes |
+| CI | GitHub Actions | Tests on every PR; Docker build on merge to main |
+
+---
+
+## Quick start
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/your-username/competitive-intel-agent.git
+git clone https://github.com/DINILKK/competitive-intel-agent.git
 cd competitive-intel-agent
-
-# 2. Copy env template and fill in your keys
-cp .env.example .env
-# Edit .env — add GROQ_API_KEY and TAVILY_API_KEY
-
-# 3. Install dependencies
+cp .env.example .env        # add your two API keys
 pip install -r requirements.txt
-
-# 4. Start the server
 python main.py
+```
 
-# 5. Trigger an analysis
+Get free API keys (no credit card, 2 minutes):
+- **Groq** — [console.groq.com](https://console.groq.com) — 14,400 req/day free
+- **Tavily** — [app.tavily.com](https://app.tavily.com) — 1,000 searches/month free
+
+Trigger an analysis:
+```bash
+# Start a run (returns immediately)
 curl -X POST http://localhost:8080/analyze \
   -H "Content-Type: application/json" \
-  -d '{"company_url":"https://linear.app"}'
+  -d '{"company_url":"https://stripe.com"}'
 
-# Poll for the result
+# Poll for result (ready in ~60s)
 curl http://localhost:8080/reports/1
+```
+
+---
+
+## API
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/analyze` | Start analysis — returns `202` + `report_id` immediately |
+| `GET` | `/reports/{id}` | Fetch report by ID — includes `token_cost_usd` and `run_ms` |
+| `GET` | `/reports` | List all past reports |
+| `GET` | `/health` | Uptime + run counters (total / success / error) |
+| `GET` | `/metrics` | Prometheus-format counters |
+
+```json
+POST /analyze
+{
+  "company_url": "https://linear.app",
+  "force_refresh": false
+}
 ```
 
 ---
@@ -84,83 +131,39 @@ curl http://localhost:8080/reports/1
 ## Deploy to Fly.io
 
 ```bash
-# 1. Authenticate
 fly auth login
-
-# 2. Create the app (one-time)
 fly apps create competitive-intel-agent
-
-# 3. Set secrets
+fly volumes create data --size 1 --region fra
 fly secrets set GROQ_API_KEY=gsk_... TAVILY_API_KEY=tvly-...
-
-# 4. Deploy
 fly deploy
 ```
 
-The app will be live at `https://competitive-intel-agent.fly.dev`.
+Live at `https://competitive-intel-agent.fly.dev`.
 
 ---
 
-## API Reference
-
-| Method | Path                  | Description                                              |
-|--------|-----------------------|----------------------------------------------------------|
-| POST   | `/analyze`            | Start an analysis (returns 202 + report_id immediately)  |
-| GET    | `/reports`            | List all reports (latest first, `?limit=20`)             |
-| GET    | `/reports/{id}`       | Fetch a single report by ID (404 if not found)           |
-| GET    | `/health`             | Service health + uptime + run counters                   |
-| GET    | `/metrics`            | Prometheus-format counters for scraping                  |
-
-**POST `/analyze` request body:**
-```json
-{
-  "company_url": "https://linear.app",
-  "force_refresh": false
-}
-```
-Set `force_refresh: true` to bypass the 24-hour cache.
-
----
-
-## Monitoring
-
-**`/health`** returns:
-```json
-{
-  "status": "ok",
-  "uptime_seconds": 142.3,
-  "runs": {"total": 5, "success": 4, "error": 1}
-}
-```
-
-**`/metrics`** returns Prometheus text format — wire it to Grafana or any Prometheus-compatible scraper.
-
-**`token_cost_usd`** in each report shows the exact LLM spend for that run, calculated from:
-- Input tokens × $0.00059 / 1K
-- Output tokens × $0.00079 / 1K
-
-Typical cost: **$0.001–$0.005 per report**.
-
----
-
-## Free API Keys
-
-| Service       | URL                        | Free Tier                     |
-|---------------|----------------------------|-------------------------------|
-| Groq (LLM)    | https://console.groq.com   | 14,400 requests/day, no card  |
-| Tavily (search)| https://app.tavily.com    | 1,000 searches/month, no card |
-
-Both are instant signup — no credit card required.
-
----
-
-## Running Tests
+## Tests
 
 ```bash
 DB_PATH=:memory: pytest tests/ -v
 ```
 
-All 13 tests run with zero real API keys — every external call is mocked.
+13 tests, zero real API calls — all external dependencies mocked. Tests cover the DB layer, each tool, all 5 API routes, cache hit/miss logic, and background task triggering.
+
+---
+
+## Monitoring
+
+Each report stores exact token spend:
+
+```json
+{
+  "token_cost_usd": 0.000815,
+  "run_ms": 11529
+}
+```
+
+`/health` shows live run counters. `/metrics` is Prometheus-compatible — wire to Grafana if needed. Every tool call logs `latency_ms` and `event: tool_success | tool_failure` in structured JSON.
 
 ---
 
