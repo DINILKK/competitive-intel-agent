@@ -127,7 +127,7 @@ POST /analyze
 ```
 
 ---
-
+<!-- 
 ## Deploy to Fly.io
 
 ```bash
@@ -138,7 +138,7 @@ fly secrets set GROQ_API_KEY=gsk_... TAVILY_API_KEY=tvly-...
 fly deploy
 ```
 
-Live at `https://competitive-intel-agent.fly.dev`.
+Live at `https://competitive-intel-agent.fly.dev`. -->
 
 ---
 
